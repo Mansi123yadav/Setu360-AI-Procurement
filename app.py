@@ -1,386 +1,681 @@
-import os
-import fitz  # PyMuPDF
-import pdfplumber
-import io
-from PIL import Image
-import google.generativeai as genai
-from dotenv import load_dotenv
-import json
-import streamlit as st
-from collections import defaultdict
-import pytesseract
-from fuzzywuzzy import fuzz
-
-# --- Configuration ---
-load_dotenv()
-
-# Set Tesseract path if you are on Windows and it's not in your PATH
-# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# Load API key from environment variables
-try:
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-except KeyError:
-    st.error("FATAL: GOOGLE_API_KEY environment variable not set. Please create a .env file or set the environment variable.")
-    st.stop()
-
-# --- Prompts ---
-# MODIFIED PROMPT TO RE-INCLUDE PAYMENT TERMS - Note: This is kept for the model's context, but the user's request removes the check.
-TEXT_PROMPT = """
-You are an expert accounts payable specialist. Your task is to analyze the following text content from an invoice and a purchase order and extract key information.
-
-The INVOICE text may contain one or more distinct invoices. You must aggregate the data from all of them.
-
-From the INVOICE text, extract:
-- Invoice Number: List all unique invoice numbers found, separated by a comma.
-- Purchase Order (PO) Number: Use the PO number that is common across all invoices.
-- Date: Use the date from the latest invoice found.
-- Vendor Name: Extract the vendor name.
-- A list of all line items: Find all line items across ALL invoices in the text. If an item with the same description appears on multiple invoices or multiple times, you MUST sum their quantities and calculate the total price accordingly.
-- Total Amount: Sum the total amounts from ALL invoices found in the text.
-
-From the PURCHASE ORDER text, extract:
-- PO Number
-- Date
-- Vendor Name
-- A list of all ordered items. Each item should have a 'description', 'quantity', and 'price'.
-- Total Amount
-
-Return your findings ONLY as a single, minified JSON object. The JSON structure must be:
-{
-  "invoice_data": {
-    "invoice_no": "...", "po_no": "...", "date": "...", "vendor": "...",
-    "items": [{"description": "...", "quantity": 1, "price": 0.00}],
-    "total": 0.00
-  },
-  "po_data": {
-    "po_no": "...", "date": "...", "vendor": "...",
-    "items": [{"description": "...", "quantity": 1, "price": 0.00}],
-    "total": 0.00
-  }
-}
+"""
+SETU360 - AI Procurement Reconciliation for Regional Contractors
+Three-way matching:  Purchase Order  ->  Delivery Challan  ->  Invoice
+Built on Streamlit + Google Gemini (extraction) + rule-based matching engine.
 """
 
-IMAGE_PROMPT = TEXT_PROMPT # Use the same powerful prompt for images
+import io
+import os
+import re
+import json
+import copy
+import html
+from collections import OrderedDict
 
-# --- Gemini API Interaction ---
-def get_gemini_response(payload):
-    model = genai.GenerativeModel('models/gemini-pro-latest')
-    response = None
-    try:
-        generation_config = genai.types.GenerationConfig(temperature=0)
-        response = model.generate_content(payload, generation_config=generation_config)
-        json_text = response.text.strip().replace('```json', '').replace('```', '')
-        return json.loads(json_text)
-    except Exception as e:
-        st.error(f"An error occurred with the Gemini API or its response: {e}")
-        if response:
-            st.write("Raw Gemini response:", response.text)
-        return None
+try:
+    import pymupdf as fitz  # PyMuPDF (new name)
+except ImportError:
+    import fitz  # PyMuPDF (old name)
+import pdfplumber
+import pytesseract
+import streamlit as st
+import google.generativeai as genai
+from dotenv import load_dotenv
+from fuzzywuzzy import fuzz
+from PIL import Image
 
-# --- Helpers ---
-def get_text_from_pdf(file_path):
-    """Attempts to extract text using pdfplumber, falls back to OCR if it fails."""
+load_dotenv()
+
+st.set_page_config(
+    page_title="Setu360 | AI Procurement Reconciliation",
+    page_icon="🌉",
+    layout="wide",
+)
+
+# =====================================================================
+# SETTINGS
+# =====================================================================
+QTY_EPS = 0.001        # quantity tolerance
+PRICE_TOL = 0.005      # 0.5% price tolerance
+FUZZY_MIN = 80         # fuzzy match threshold for names / items
+DEMO_MODE = "Demo scenarios (no PDFs needed)"
+LIVE_MODE = "Upload PDFs (AI extraction)"
+
+# =====================================================================
+# STYLING
+# =====================================================================
+CSS = """
+<style>
+#MainMenu {visibility: hidden;} footer {visibility: hidden;}
+.block-container {padding-top: 1.5rem; max-width: 1250px;}
+section[data-testid="stSidebar"] .stButton > button {width: 100%;}
+.s360-hero {background: linear-gradient(120deg,#0f172a 0%,#1e1b4b 55%,#4338ca 100%);
+  border-radius: 14px; padding: 26px 32px; margin-bottom: 18px; color: #fff;}
+.s360-brand {font-size: 2.1rem; font-weight: 800; letter-spacing: 3px;}
+.s360-brand span {color: #5eead4;}
+.s360-tag {font-size: 1.05rem; color: #c7d2fe; margin-top: 2px;}
+.s360-flow {margin-top: 14px; font-size: .78rem; letter-spacing: 1px; font-weight: 600;}
+.s360-flow .pill {background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.25);
+  padding: 4px 12px; border-radius: 999px;}
+.s360-flow .arr {margin: 0 8px; color: #5eead4;}
+.card {background: #fff; color: #0f172a; border: 1px solid #e2e8f0; border-radius: 12px;
+  padding: 16px 18px; margin-bottom: 14px; box-shadow: 0 1px 3px rgba(15,23,42,.06);}
+.card-title {font-weight: 700; font-size: 1.02rem; margin-bottom: 10px; color: #1e1b4b;}
+.kv {display: flex; justify-content: space-between; font-size: .88rem; padding: 3px 0;
+  border-bottom: 1px dashed #e2e8f0;}
+.kv span {color: #64748b;} .kv b {text-align: right;}
+.doc-total {text-align: right; margin-top: 10px; font-size: .95rem;}
+.s360-table {width: 100%; border-collapse: collapse; font-size: .84rem; margin-top: 10px; color: #0f172a;}
+.s360-table th {background: #f1f5f9; text-align: left; padding: 8px; border: 1px solid #e2e8f0; color: #334155;}
+.s360-table td {padding: 8px; border: 1px solid #e2e8f0; background: #fff;}
+.s360-table .num {text-align: right; white-space: nowrap;}
+.s360-table tr.row-fail td {background: #fef2f2;}
+.s360-table tr.row-warn td {background: #fffbeb;}
+.s360-table td.bad {color: #b91c1c; font-weight: 700;}
+.chip {display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: .72rem; font-weight: 700;}
+.chip-ok {background: #dcfce7; color: #166534;}
+.chip-fail {background: #fee2e2; color: #991b1b;}
+.chip-warn {background: #fef3c7; color: #92400e;}
+.verdict {border-radius: 12px; padding: 18px 24px; margin: 6px 0 16px 0; font-size: 1.35rem; font-weight: 800;}
+.verdict small {display: block; font-size: .92rem; font-weight: 500; margin-top: 4px;}
+.verdict-ok {background: #dcfce7; color: #14532d; border: 2px solid #16a34a;}
+.verdict-fail {background: #fee2e2; color: #7f1d1d; border: 2px solid #dc2626;}
+.metric {background: #fff; color: #0f172a; border: 1px solid #e2e8f0; border-radius: 12px; padding: 14px 16px; text-align: center;}
+.metric .v {font-size: 1.6rem; font-weight: 800; color: #1e1b4b;}
+.metric .l {font-size: .78rem; color: #64748b; text-transform: uppercase; letter-spacing: .5px;}
+.pipe {display: flex; align-items: stretch; gap: 8px; margin-bottom: 16px;}
+.pipe .node {flex: 1; background: #fff; color: #0f172a; border: 1px solid #e2e8f0; border-top: 4px solid #4338ca;
+  border-radius: 10px; padding: 12px 14px; font-size: .85rem;}
+.pipe .node .t {font-size: .72rem; color: #64748b; font-weight: 700; letter-spacing: 1px;}
+.pipe .node .n {font-size: 1.05rem; font-weight: 800; color: #1e1b4b;}
+.pipe .link {align-self: center; text-align: center; min-width: 110px; font-size: .75rem; font-weight: 700;}
+.pipe .link .a {font-size: 1.4rem; color: #94a3b8;}
+.issue {border-left: 5px solid #dc2626; background: #fef2f2; color: #7f1d1d; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; font-size: .9rem;}
+.warnbox {border-left: 5px solid #d97706; background: #fffbeb; color: #78350f; padding: 10px 14px; border-radius: 6px; margin-bottom: 8px; font-size: .9rem;}
+.tag {display: inline-block; background: #7f1d1d; color: #fff; font-size: .68rem; padding: 1px 8px; border-radius: 4px; margin-right: 8px; font-weight: 700;}
+.tag.w {background: #92400e;}
+.agent {border-left: 4px solid #4338ca; background: #eef2ff; color: #1e1b4b; padding: 14px 18px; border-radius: 8px; font-size: .93rem;}
+.agent p {margin: 6px 0;}
+.how {background: #fff; color: #0f172a; border: 1px solid #e2e8f0; border-radius: 12px; padding: 18px; min-height: 150px;}
+.how .num {font-size: 1.6rem; font-weight: 800; color: #4338ca;}
+.s360-footer {text-align: center; color: #94a3b8; font-size: .78rem; margin-top: 30px;}
+</style>
+"""
+
+
+def H(s):
+    """Collapse HTML to one line so Streamlit's markdown never treats it as code."""
+    return " ".join(line.strip() for line in s.splitlines() if line.strip())
+
+
+st.markdown(H(CSS), unsafe_allow_html=True)
+
+# =====================================================================
+# SMALL HELPERS
+# =====================================================================
+CUR = "₹"
+
+
+def esc(v):
+    if v is None or str(v).strip() == "":
+        return "—"
+    return html.escape(str(v))
+
+
+def to_float(v):
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = re.sub(r"[^0-9.,\-]", "", str(v))
+    if not re.search(r"\d", s):
+        return 0.0
+    if "," in s and "." in s:
+        s = s.replace(",", "")
+    elif "," in s:
+        s = s.replace(",", ".") if re.search(r",\d{1,2}$", s) else s.replace(",", "")
     try:
-        text_content = ""
-        with pdfplumber.open(file_path) as pdf:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def money(x):
+    return f"{CUR}{x:,.2f}"
+
+
+def qty(x):
+    if x is None:
+        return "—"
+    return f"{x:,.0f}" if float(x).is_integer() else f"{x:,.2f}"
+
+
+def chip(status, text=None):
+    labels = {"ok": "MATCH", "fail": "MISMATCH", "warn": "CHECK"}
+    return f'<span class="chip chip-{status}">{text or labels[status]}</span>'
+
+
+def table(headers, rows, num_cols=()):
+    """rows: list of (cells, row_class, bad_cell_indexes)"""
+    out = "<table class='s360-table'><thead><tr>"
+    out += "".join(f"<th>{h}</th>" for h in headers) + "</tr></thead><tbody>"
+    for cells, row_class, bad in rows:
+        out += f"<tr class='{row_class}'>"
+        for i, c in enumerate(cells):
+            cls = []
+            if i in num_cols:
+                cls.append("num")
+            if i in bad:
+                cls.append("bad")
+            out += f"<td class='{' '.join(cls)}'>{c}</td>"
+        out += "</tr>"
+    out += "</tbody></table>"
+    return out
+
+
+# =====================================================================
+# PDF TEXT EXTRACTION (existing technology: pdfplumber + Tesseract OCR)
+# =====================================================================
+def get_text_from_pdf(file_bytes):
+    try:
+        text = ""
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
-                page_text = page.extract_text(x_tolerance=2)
-                if page_text:
-                    text_content += page_text + "\n"
-        if text_content.strip():
-            return text_content.strip()
+                t = page.extract_text(x_tolerance=2)
+                if t:
+                    text += t + "\n"
+        if text.strip():
+            return text.strip()
     except Exception as e:
-        st.warning(f"Text extraction with pdfplumber failed: {e}. Falling back to OCR.")
-    
+        st.warning(f"Text extraction failed ({e}). Trying OCR instead.")
     try:
-        text_content = ""
-        doc = fitz.open(file_path)
-        for page_num in range(len(doc)):
-            page = doc.load_page(page_num)
-            pix = page.get_pixmap(dpi=300)
+        text = ""
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for n in range(len(doc)):
+            pix = doc.load_page(n).get_pixmap(dpi=300)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            text_content += pytesseract.image_to_string(img) + "\n"
+            text += pytesseract.image_to_string(img) + "\n"
         doc.close()
-        return text_content.strip()
+        return text.strip()
     except Exception as e:
-        st.error(f"OCR with Tesseract failed: {e}")
+        st.error(f"OCR failed: {e}")
         return ""
 
-# --- Item Aggregation Logic ---
-def normalize_and_aggregate_items(items):
-    """
-    Takes a list of item dicts, aggregates quantities for identical items,
-    and returns a clean list for display.
-    """
+
+# =====================================================================
+# GEMINI EXTRACTION (existing technology)
+# =====================================================================
+EXTRACTION_PROMPT = """
+You are an expert accounts-payable and site-procurement specialist.
+You are given the text of THREE documents that belong to one transaction:
+1. PURCHASE ORDER (PO) - what the contractor ordered.
+2. DELIVERY CHALLAN (DC) - the goods delivery / receipt note. Its quantities are what was ACTUALLY DELIVERED.
+3. INVOICE - what the vendor is billing.
+
+The INVOICE text may contain several invoices. Aggregate them: list every unique invoice number separated by commas,
+use the latest date, sum the quantities of identical items, and sum the totals.
+The DELIVERY CHALLAN may list several trips/challans. Aggregate them the same way.
+
+For each item extract: description, quantity (number), price (UNIT price as a number; use 0 if not shown).
+Numbers must be plain numbers without currency symbols or thousands separators.
+
+Return ONLY one minified JSON object with exactly this structure:
+{
+"po_data": {"po_no": "...", "date": "...", "vendor": "...", "items": [{"description": "...", "quantity": 0, "price": 0}], "total": 0},
+"challan_data": {"challan_no": "...", "po_no": "...", "date": "...", "vendor": "...", "items": [{"description": "...", "quantity": 0, "price": 0}]},
+"invoice_data": {"invoice_no": "...", "po_no": "...", "date": "...", "vendor": "...", "items": [{"description": "...", "quantity": 0, "price": 0}], "total": 0}
+}
+In challan_data and invoice_data, "po_no" is the PO number referenced on that document (empty string if none).
+"""
+
+
+def call_gemini(payload):
+    key = os.environ.get("GOOGLE_API_KEY")
+    if not key:
+        try:
+            key = st.secrets["GOOGLE_API_KEY"]
+        except Exception:
+            key = None
+    if not key:
+        st.error("GOOGLE_API_KEY is not set. Add it as a secret (or .env file), or use the Demo scenarios mode.")
+        return None
+    genai.configure(api_key=key)
+    last_error = None
+    for model_name in ("models/gemini-pro-latest", "models/gemini-flash-latest"):
+        try:
+            model = genai.GenerativeModel(model_name)
+            cfg = genai.types.GenerationConfig(temperature=0, response_mime_type="application/json")
+            resp = model.generate_content(payload, generation_config=cfg)
+            text = re.sub(r"^```(?:json)?|```$", "", resp.text.strip(), flags=re.M).strip()
+            data = json.loads(text)
+            if isinstance(data, dict) and all(
+                isinstance(data.get(k), dict) for k in ("po_data", "challan_data", "invoice_data")
+            ):
+                return data
+            last_error = "AI response was missing one of the three documents."
+        except Exception as e:  # try the next model
+            last_error = e
+    st.error(f"AI extraction failed: {last_error}. Please click the button again.")
+    return None
+
+
+# =====================================================================
+# DEMO DATA (so the project can be demonstrated without any PDFs)
+# =====================================================================
+VENDOR = "Sharma Steel & Cement Traders"
+BASE_ITEMS = [
+    ("TMT Steel Bar Fe500 12mm (kg)", 5000, 62.00),
+    ("OPC Cement 53 Grade, 50kg bag", 400, 385.00),
+    ("Red Clay Bricks (nos)", 10000, 8.50),
+]
+
+
+def build_demo(dc_qty=(5000, 400, 10000), inv_qty=(5000, 400, 10000),
+               inv_price=(62.00, 385.00, 8.50), inv_vendor=None):
+    po = {
+        "po_no": "PO-2026-0417", "date": "02-Sep-2026", "vendor": VENDOR,
+        "items": [{"description": d, "quantity": q, "price": p} for d, q, p in BASE_ITEMS],
+        "total": sum(q * p for _, q, p in BASE_ITEMS),
+    }
+    dc = {
+        "challan_no": "DC-8841", "po_no": "PO-2026-0417", "date": "09-Sep-2026", "vendor": VENDOR,
+        "items": [{"description": BASE_ITEMS[i][0], "quantity": dc_qty[i], "price": 0} for i in range(3)],
+    }
+    inv = {
+        "invoice_no": "INV-3302", "po_no": "PO-2026-0417", "date": "12-Sep-2026",
+        "vendor": inv_vendor or VENDOR,
+        "items": [{"description": BASE_ITEMS[i][0], "quantity": inv_qty[i], "price": inv_price[i]} for i in range(3)],
+        "total": sum(inv_qty[i] * inv_price[i] for i in range(3)),
+    }
+    return {"po_data": po, "challan_data": dc, "invoice_data": inv}
+
+
+SCENARIOS = OrderedDict([
+    ("1 · Clean match — all three documents agree", build_demo()),
+    ("2 · Quantity discrepancy — billed for goods not delivered",
+     build_demo(dc_qty=(4600, 400, 10000))),
+    ("3 · Price discrepancy — invoice rate higher than PO",
+     build_demo(inv_price=(62.00, 410.00, 8.50))),
+    ("4 · Vendor mismatch — invoice from a different vendor",
+     build_demo(inv_vendor="Verma Building Supplies")),
+    ("5 · Valid partial delivery — billed only for what arrived",
+     build_demo(dc_qty=(5000, 400, 6000), inv_qty=(5000, 400, 6000))),
+])
+
+# =====================================================================
+# MATCHING ENGINE  (Purchase Order -> Delivery Challan -> Invoice)
+# =====================================================================
+LEGAL_WORDS = {"pvt", "ltd", "limited", "private", "llp", "co", "company", "inc", "llc", "the", "and", "m", "s", "ms"}
+
+
+def norm_vendor(name):
+    tokens = [t for t in re.findall(r"[a-z0-9]+", str(name or "").lower()) if t not in LEGAL_WORDS]
+    return " ".join(tokens)
+
+
+def vendor_same(a, b):
+    na, nb = norm_vendor(a), norm_vendor(b)
+    if not na or not nb:
+        return None
+    return fuzz.token_set_ratio(na, nb) >= FUZZY_MIN
+
+
+def norm_ref(x):
+    return re.sub(r"[^A-Z0-9]", "", str(x or "").upper())
+
+
+def norm_key(desc):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(desc).lower())).strip()
+
+
+def _nums(k):
+    return set(re.findall(r"\d+", k))
+
+
+def aggregate(items, ref_keys=None):
+    out = OrderedDict()
     if not isinstance(items, list):
-        return []
-    normalized = defaultdict(lambda: {"quantity": 0, "description": "", "price": 0.0})
-    for item in items:
-        if not isinstance(item, dict) or not item.get("description"): continue
-        desc_key = item.get("description", "").strip().lower()
-        if desc_key.startswith("culture "):
-            desc_key = desc_key[len("culture "):]
-        
-        if not normalized[desc_key]["description"]:
-            normalized[desc_key]["description"] = item.get("description")
-        try:
-            quantity = float(item.get("quantity", 0))
-            unit_price = float(str(item.get("price", 0.0)).replace(',', '.'))
-        except (ValueError, TypeError):
-            quantity, unit_price = 0, 0.0
-        normalized[desc_key]["quantity"] += quantity
-        if unit_price > 0:
-                normalized[desc_key]["price"] = unit_price
-    return list(normalized.values())
+        return out
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        desc = str(it.get("description") or "").strip()
+        if not desc:
+            continue
+        key = norm_key(desc)
+        if ref_keys and key not in ref_keys:
+            best, score = None, 0
+            for rk in ref_keys:
+                if _nums(rk) != _nums(key):
+                    continue
+                s = fuzz.token_set_ratio(key, rk)
+                if s > score:
+                    best, score = rk, s
+            if best and score >= FUZZY_MIN:
+                key = best
+        row = out.setdefault(key, {"description": desc, "quantity": 0.0, "price": 0.0})
+        row["quantity"] += to_float(it.get("quantity"))
+        p = to_float(it.get("price"))
+        if p > 0:
+            row["price"] = p
+    return out
 
-# --- Streamlit UI ---
-st.set_page_config(page_title="Invoice & PO Matching Tool", layout="wide")
-st.markdown("""
-<link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
-<style>
-    .card { background-color: #ffffff; border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); padding: 20px; margin-bottom: 20px; }
-    .header { background-color: #1f2937; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-    .sidebar-card { background-color: #f9fafb; border-radius: 8px; padding: 20px; margin-bottom: 20px; }
-    .table-header { background-color: #f9fafb; font-weight: 600; }
-    .status-approved { color: #15803d; font-weight: bold; }
-    .status-review { color: #b91c1c; font-weight: bold; }
-    .agent-summary { border-left: 4px solid #4f46e5; padding-left: 16px; margin-top: 16px; font-family: sans-serif; }
-</style>
-""", unsafe_allow_html=True)
 
-st.markdown('<div class="header"><h1>📑 Invoice & PO Matching Tool</h1><p class="mt-2 text-sm">Upload an Invoice and Purchase Order to automatically compare and verify their details.</p></div>', unsafe_allow_html=True)
+def reconcile(po, dc, inv):
+    issues, warnings, checks = [], [], []
 
+    def issue(kind, link, msg):
+        issues.append({"type": kind, "link": link, "message": msg})
+
+    def warn(kind, msg):
+        warnings.append({"type": kind, "message": msg})
+
+    # ---- vendor ----
+    v_po, v_dc, v_inv = (str(d.get("vendor") or "").strip() for d in (po, dc, inv))
+    same_dc, same_inv = vendor_same(v_po, v_dc), vendor_same(v_po, v_inv)
+    if same_dc is False:
+        issue("VENDOR", "PO-DC", f"Vendor mismatch: Delivery Challan is from '{v_dc}' but the PO was placed with '{v_po}'.")
+    if same_inv is False:
+        issue("VENDOR", "PO-INV", f"Vendor mismatch: Invoice is from '{v_inv}' but the PO was placed with '{v_po}'.")
+    if same_dc is None or same_inv is None:
+        warn("VENDOR", "Vendor name could not be read from one of the documents - please verify manually.")
+    v_status = "fail" if (same_dc is False or same_inv is False) else ("warn" if None in (same_dc, same_inv) else "ok")
+    checks.append(("Vendor", v_po, v_dc, v_inv, v_status))
+
+    # ---- PO reference ----
+    ref_po, ref_dc, ref_inv = norm_ref(po.get("po_no")), norm_ref(dc.get("po_no")), norm_ref(inv.get("po_no"))
+    r_status = "ok"
+    if not ref_po:
+        warn("PO REF", "PO number could not be read from the Purchase Order.")
+        r_status = "warn"
+    else:
+        if not ref_dc:
+            warn("PO REF", "Delivery Challan does not reference a PO number.")
+            r_status = "warn"
+        elif ref_dc != ref_po:
+            issue("PO REF", "PO-DC", f"Challan references PO '{dc.get('po_no')}' but the Purchase Order is '{po.get('po_no')}'.")
+            r_status = "fail"
+        if not ref_inv:
+            warn("PO REF", "Invoice does not reference a PO number.")
+            r_status = "warn" if r_status == "ok" else r_status
+        elif ref_inv != ref_po:
+            issue("PO REF", "PO-INV", f"Invoice references PO '{inv.get('po_no')}' but the Purchase Order is '{po.get('po_no')}'.")
+            r_status = "fail"
+    checks.append(("PO reference", po.get("po_no"), dc.get("po_no"), inv.get("po_no"), r_status))
+
+    # ---- items ----
+    po_items = aggregate(po.get("items"))
+    ref = list(po_items.keys())
+    dc_items = aggregate(dc.get("items"), ref)
+    inv_items = aggregate(inv.get("items"), ref)
+    for label, link, agg in (("Purchase Order", "PO-INV", po_items), ("Delivery Challan", "PO-DC", dc_items), ("Invoice", "PO-INV", inv_items)):
+        if not agg:
+            issue("DATA", link, f"No line items could be read from the {label}. Check the PDF quality or re-run the match.")
+    keys = list(po_items) + [k for k in dc_items if k not in po_items] + \
+        [k for k in inv_items if k not in po_items and k not in dc_items]
+
+    rows, at_risk, dc_value = [], 0.0, 0.0
+    for k in keys:
+        p, d, i = po_items.get(k), dc_items.get(k), inv_items.get(k)
+        name = (p or d or i)["description"]
+        pq = p["quantity"] if p else None
+        dq = d["quantity"] if d else None
+        iq = i["quantity"] if i else None
+        pp = p["price"] if p else 0.0
+        ip = i["price"] if i else 0.0
+        n_before_i, n_before_w = len(issues), len(warnings)
+        bad = set()
+
+        if p is None:
+            if i:
+                issue("ITEM", "PO-INV", f"'{name}' is billed on the invoice but is not on the Purchase Order.")
+                bad.add(3)
+            if d:
+                issue("ITEM", "PO-DC", f"'{name}' was delivered (challan) but is not on the Purchase Order.")
+                bad.add(2)
+        else:
+            if d is None and i is None:
+                warn("DELIVERY", f"'{name}' is on the PO but has not been delivered or invoiced yet.")
+            if d and dq > pq + QTY_EPS:
+                issue("QUANTITY", "PO-DC", f"Over-delivery on '{name}': challan shows {qty(dq)} but PO ordered only {qty(pq)}.")
+                bad.add(2)
+            if i:
+                dq_eff = dq if d else 0.0
+                if iq > dq_eff + QTY_EPS:
+                    extra = iq - dq_eff
+                    unit = ip if ip > 0 else pp
+                    at_risk += extra * unit
+                    if d:
+                        issue("QUANTITY", "DC-INV", f"Billed for undelivered goods on '{name}': invoice bills {qty(iq)} but challan shows only {qty(dq)} delivered ({qty(extra)} short, about {money(extra * unit)}).")
+                    else:
+                        issue("QUANTITY", "DC-INV", f"'{name}' is invoiced ({qty(iq)}) but no delivery is recorded on the challan.")
+                    bad.add(3)
+                if iq > pq + QTY_EPS:
+                    issue("QUANTITY", "PO-INV", f"Over-billing on '{name}': invoice bills {qty(iq)} but PO ordered only {qty(pq)}.")
+                    bad.add(3)
+                if pp > 0 and ip > 0 and abs(ip - pp) / pp > PRICE_TOL:
+                    pct = (ip - pp) / pp * 100
+                    billed_qty = min(iq, dq) if d else iq
+                    if ip > pp:
+                        at_risk += (ip - pp) * billed_qty
+                    issue("PRICE", "PO-INV", f"Price mismatch on '{name}': invoice rate {money(ip)} vs PO rate {money(pp)} ({pct:+.1f}%).")
+                    bad.add(4)
+            if d and dq < pq - QTY_EPS:
+                warn("DELIVERY", f"Partial delivery on '{name}': {qty(dq)} of {qty(pq)} ordered units delivered.")
+            if d and i and iq < dq - QTY_EPS:
+                warn("BILLING", f"Under-billed on '{name}': {qty(dq)} delivered but only {qty(iq)} invoiced.")
+            if d and not i:
+                warn("BILLING", f"'{name}' was delivered ({qty(dq)}) but is not yet invoiced.")
+            if d and pp > 0:
+                dc_value += dq * pp
+
+        status = "fail" if len(issues) > n_before_i else ("warn" if len(warnings) > n_before_w else "ok")
+        rows.append({"item": name, "po_qty": pq, "dc_qty": dq, "inv_qty": iq, "po_price": pp if p else None,
+                     "inv_price": ip if i else None, "status": status, "bad": bad})
+
+    # ---- totals ----
+    po_total = to_float(po.get("total")) or sum(r["po_qty"] * r["po_price"] for r in rows if r["po_qty"])
+    inv_total = to_float(inv.get("total"))
+    if inv_total > 0 and dc_value > 0 and abs(inv_total - dc_value) > max(1.0, 0.01 * dc_value):
+        warn("TOTAL", f"Invoice total {money(inv_total)} differs from the value of delivered goods at PO prices ({money(dc_value)}) by {money(abs(inv_total - dc_value))}. Taxes or extra charges may explain this.")
+
+    links = {l: ("fail" if any(x["link"] == l for x in issues) else "ok") for l in ("PO-DC", "DC-INV", "PO-INV")}
+    return {
+        "status": "NEEDS REVIEW" if issues else "APPROVED",
+        "issues": issues, "warnings": warnings, "checks": checks, "rows": rows, "links": links,
+        "po_total": po_total, "inv_total": inv_total, "dc_value": dc_value, "at_risk": at_risk,
+    }
+
+
+# =====================================================================
+# RENDERING
+# =====================================================================
+def doc_card(icon, title, fields, items, show_price, total=None):
+    body = "".join(f'<div class="kv"><span>{k}</span><b>{esc(v)}</b></div>' for k, v in fields)
+    rows = []
+    for r in items.values():
+        cells = [esc(r["description"]), qty(r["quantity"])]
+        if show_price:
+            cells.append(money(r["price"]) if r["price"] > 0 else "—")
+        rows.append((cells, "", set()))
+    headers = ["Description", "Qty"] + (["Unit price"] if show_price else [])
+    tbl = table(headers, rows, num_cols={1, 2}) if rows else "<p>No items found.</p>"
+    foot = f'<div class="doc-total">Total <b>{money(total)}</b></div>' if total is not None else ""
+    return H(f'<div class="card"><div class="card-title">{icon} {title}</div>{body}{tbl}{foot}</div>')
+
+
+def link_html(label, status, n):
+    sym = "✓ matched" if status == "ok" else f"✗ {n} issue(s)"
+    color = "#16a34a" if status == "ok" else "#dc2626"
+    return f'<div class="link"><div class="a">➜</div><div style="color:{color}">{sym}</div><div style="color:#94a3b8">{label}</div></div>'
+
+
+def render_result(res, docs):
+    po, dc, inv = docs["po_data"], docs["challan_data"], docs["invoice_data"]
+    ok = res["status"] == "APPROVED"
+
+    if ok:
+        st.markdown(H('<div class="verdict verdict-ok">APPROVED ✅<small>All three documents reconcile. Safe to release payment.</small></div>'), unsafe_allow_html=True)
+    else:
+        st.markdown(H(f'<div class="verdict verdict-fail">NEEDS REVIEW ⚠️<small>{len(res["issues"])} discrepancy(ies) found. Hold payment until resolved.</small></div>'), unsafe_allow_html=True)
+
+    n_issues = {l: sum(1 for x in res["issues"] if x["link"] == l) for l in res["links"]}
+    st.markdown(H(f"""
+    <div class="pipe">
+      <div class="node"><div class="t">1 · PURCHASE ORDER</div><div class="n">{esc(po.get('po_no'))}</div>{esc(po.get('vendor'))}<br>{esc(po.get('date'))}</div>
+      {link_html('PO ↔ Challan', res['links']['PO-DC'], n_issues['PO-DC'])}
+      <div class="node"><div class="t">2 · DELIVERY CHALLAN</div><div class="n">{esc(dc.get('challan_no'))}</div>{esc(dc.get('vendor'))}<br>{esc(dc.get('date'))}</div>
+      {link_html('Challan ↔ Invoice', res['links']['DC-INV'], n_issues['DC-INV'])}
+      <div class="node"><div class="t">3 · INVOICE</div><div class="n">{esc(inv.get('invoice_no'))}</div>{esc(inv.get('vendor'))}<br>{esc(inv.get('date'))}</div>
+    </div>"""), unsafe_allow_html=True)
+    if n_issues["PO-INV"]:
+        st.caption(f"PO ↔ Invoice direct check: ✗ {n_issues['PO-INV']} issue(s)")
+
+    m = st.columns(4)
+    metrics = [(len(res["rows"]), "Line items checked"), (len(res["issues"]), "Discrepancies"),
+               (len(res["warnings"]), "Warnings"), (money(res["at_risk"]), "Estimated amount at risk")]
+    for col, (v, l) in zip(m, metrics):
+        col.markdown(H(f'<div class="metric"><div class="v">{v}</div><div class="l">{l}</div></div>'), unsafe_allow_html=True)
+    st.write("")
+
+    t1, t2, t3 = st.tabs(["📋 Extracted Fields", "⚖️ Three-Way Match", "🚨 Discrepancies & Summary"])
+
+    with t1:
+        c1, c2, c3 = st.columns(3)
+        po_total = res["po_total"]
+        with c1:
+            st.markdown(doc_card("📑", "Purchase Order", [("PO number", po.get("po_no")), ("Date", po.get("date")), ("Vendor", po.get("vendor"))],
+                                 aggregate(po.get("items")), True, po_total), unsafe_allow_html=True)
+        with c2:
+            st.markdown(doc_card("🚚", "Delivery Challan", [("Challan number", dc.get("challan_no")), ("PO reference", dc.get("po_no")), ("Date", dc.get("date")), ("Vendor", dc.get("vendor"))],
+                                 aggregate(dc.get("items")), False), unsafe_allow_html=True)
+        with c3:
+            st.markdown(doc_card("🧾", "Invoice", [("Invoice number", inv.get("invoice_no")), ("PO reference", inv.get("po_no")), ("Date", inv.get("date")), ("Vendor", inv.get("vendor"))],
+                                 aggregate(inv.get("items")), True, res["inv_total"]), unsafe_allow_html=True)
+
+    with t2:
+        st.markdown("#### Header checks")
+        crow = [([c[0], esc(c[1]), esc(c[2]), esc(c[3]), chip(c[4])], "row-fail" if c[4] == "fail" else ("row-warn" if c[4] == "warn" else ""), set())
+                for c in res["checks"]]
+        st.markdown(H(table(["Check", "Purchase Order", "Delivery Challan", "Invoice", "Result"], crow)), unsafe_allow_html=True)
+
+        st.markdown("#### Line-item three-way match")
+        irow = []
+        for r in res["rows"]:
+            cells = [esc(r["item"]), qty(r["po_qty"]), qty(r["dc_qty"]), qty(r["inv_qty"]),
+                     money(r["po_price"]) if r["po_price"] else "—", money(r["inv_price"]) if r["inv_price"] else "—",
+                     chip(r["status"], {"ok": "OK", "warn": "CHECK", "fail": "DISCREPANCY"}[r["status"]])]
+            irow.append((cells, {"fail": "row-fail", "warn": "row-warn", "ok": ""}[r["status"]], r["bad"]))
+        st.markdown(H(table(["Item", "PO qty", "Delivered qty", "Invoiced qty", "PO price", "Invoice price", "Result"], irow, num_cols={1, 2, 3, 4, 5})), unsafe_allow_html=True)
+
+        st.markdown("#### Financial summary")
+        frow = [([ "PO total (ordered)", money(res["po_total"])], "", set()),
+                (["Value of goods delivered (at PO prices)", money(res["dc_value"])], "", set()),
+                (["Invoice total (billed)", money(res["inv_total"])], "", set()),
+                (["Estimated amount at risk", money(res["at_risk"])], "row-fail" if res["at_risk"] > 0 else "", set())]
+        st.markdown(H(table(["Measure", "Amount"], frow, num_cols={1})), unsafe_allow_html=True)
+
+    with t3:
+        if res["issues"]:
+            st.markdown("#### Discrepancies (cause NEEDS REVIEW)")
+            for x in res["issues"]:
+                st.markdown(H(f'<div class="issue"><span class="tag">{x["type"]}</span>{html.escape(x["message"])}</div>'), unsafe_allow_html=True)
+        else:
+            st.success("No discrepancies found across vendor, PO reference, quantities and prices.")
+        if res["warnings"]:
+            st.markdown("#### Warnings (informational, do not block approval)")
+            for x in res["warnings"]:
+                st.markdown(H(f'<div class="warnbox"><span class="tag w">{x["type"]}</span>{html.escape(x["message"])}</div>'), unsafe_allow_html=True)
+        st.markdown("#### Agent-style summary")
+        st.markdown(agent_summary(res, po, dc, inv), unsafe_allow_html=True)
+
+
+def agent_summary(res, po, dc, inv):
+    head = (f"Reviewed Purchase Order <b>{esc(po.get('po_no'))}</b>, Delivery Challan <b>{esc(dc.get('challan_no'))}</b> "
+            f"and Invoice <b>{esc(inv.get('invoice_no'))}</b> from <b>{esc(po.get('vendor'))}</b>.")
+    if not res["issues"]:
+        body = "<p>Vendor, PO reference, delivered quantities and unit prices agree across all three documents.</p>"
+        if res["warnings"]:
+            body += f"<p>{len(res['warnings'])} informational note(s) were raised (for example partial deliveries) but none block payment.</p>"
+        body += "<p><b>Recommendation:</b> ✅ Approve the invoice for payment.</p>"
+    else:
+        kinds = {x["type"] for x in res["issues"]}
+        body = f"<p>{len(res['issues'])} discrepancy(ies) were found, with an estimated <b>{money(res['at_risk'])}</b> at risk of overpayment.</p>"
+        steps = []
+        if "QUANTITY" in kinds:
+            steps.append("confirm physical receipt with the site store and ask the vendor for a corrected invoice or credit note")
+        if "PRICE" in kinds:
+            steps.append("ask the vendor to re-issue the invoice at PO-agreed rates, or get a PO amendment approved")
+        if "VENDOR" in kinds:
+            steps.append("verify the vendor identity and bank details before any payment")
+        if "PO REF" in kinds or "ITEM" in kinds:
+            steps.append("check that the documents belong to the same order and that no unordered items were supplied")
+        body += "<p><b>Recommendation:</b> ⚠️ Hold payment. Next steps: " + "; ".join(steps) + ".</p>"
+    return H(f'<div class="agent"><p>{head}</p>{body}</div>')
+
+
+# =====================================================================
+# SIDEBAR
+# =====================================================================
 with st.sidebar:
-    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
-    st.subheader("Upload Documents")
-    invoice_file = st.file_uploader("📄 Invoice", type=["pdf"], key="invoice")
-    po_file = st.file_uploader("📑 Purchase Order", type=["pdf"], key="po")
-    
-    if st.button("🔍 Compare Documents", key="compare", use_container_width=True):
-        if invoice_file and po_file:
-            with open(invoice_file.name, "wb") as f:
-                f.write(invoice_file.getbuffer())
-            with open(po_file.name, "wb") as f:
-                f.write(po_file.getbuffer())
-            
-            with st.spinner("Analyzing documents... This may take a moment."):
-                invoice_text = get_text_from_pdf(invoice_file.name)
-                po_text = get_text_from_pdf(po_file.name)
-                
-                if invoice_text and po_text:
-                    payload = [TEXT_PROMPT, f"--- INVOICE TEXT ---\n{invoice_text}", f"--- PO TEXT ---\n{po_text}"]
-                    st.session_state['analysis'] = get_gemini_response(payload)
-                else:
-                    st.error("Failed to extract text from one or both documents.")
-                    st.session_state['analysis'] = None
+    st.markdown("### 🌉 SETU360")
+    st.caption("AI Procurement Reconciliation")
+    CUR = st.selectbox("Currency", ["₹", "SAR "], index=0)
+    mode = st.radio("Mode", [DEMO_MODE, LIVE_MODE])
+    st.markdown("---")
+    scenario, po_file, dc_file, inv_file = None, None, None, None
+    if mode == DEMO_MODE:
+        scenario = st.selectbox("Choose a scenario", list(SCENARIOS.keys()))
+    else:
+        po_file = st.file_uploader("📑 Purchase Order (PDF)", type=["pdf"], key="po")
+        dc_file = st.file_uploader("🚚 Delivery Challan (PDF)", type=["pdf"], key="dc")
+        inv_file = st.file_uploader("🧾 Invoice (PDF)", type=["pdf"], key="inv")
+    run = st.button("🔍 Run Three-Way Match", key="run", type="primary")
+    st.markdown("---")
+    st.caption("Rules: APPROVED only when vendor, PO reference, quantities and prices all agree. Partial deliveries billed correctly are allowed.")
 
-            os.remove(invoice_file.name)
-            os.remove(po_file.name)
-        else:
-            st.error("Please upload both an Invoice and a Purchase Order file.")
-    st.markdown('</div>', unsafe_allow_html=True)
+# =====================================================================
+# MAIN PAGE
+# =====================================================================
+st.markdown(H("""
+<div class="s360-hero">
+  <div class="s360-brand">SETU<span>360</span></div>
+  <div class="s360-tag">AI Procurement Reconciliation for Regional Contractors</div>
+  <div class="s360-flow"><span class="pill">PURCHASE ORDER</span><span class="arr">➜</span><span class="pill">DELIVERY CHALLAN</span><span class="arr">➜</span><span class="pill">INVOICE</span></div>
+</div>"""), unsafe_allow_html=True)
 
-if 'analysis' in st.session_state and st.session_state['analysis']:
-    analysis = st.session_state['analysis']
-    invoice_data = analysis.get('invoice_data', {})
-    po_data = analysis.get('po_data', {})
-
-    col1, col2 = st.columns(2)
-
-    def display_doc(title, data, doc_type):
-        st.markdown(f'<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<h2 class="text-xl font-semibold mb-3">{title}</h2>', unsafe_allow_html=True)
-        
-        doc_no_key = "invoice_no" if doc_type == "invoice" else "po_no"
-        st.markdown(f'<p><strong>{doc_type.capitalize()} #:</strong> {data.get(doc_no_key, "N/A")}</p>', unsafe_allow_html=True)
-        if doc_type == 'invoice':
-            st.markdown(f'<p><strong>PO #:</strong> {data.get("po_no", "N/A")}</p>', unsafe_allow_html=True)
-        
-        st.markdown(f'<p><strong>Date:</strong> {data.get("date", "N/A")}</p>', unsafe_allow_html=True)
-        st.markdown(f'<p><strong>Vendor:</strong> {data.get("vendor", "N/A")}</p>', unsafe_allow_html=True)
-        st.markdown('<h3 class="text-lg font-medium mt-4">Items</h3>', unsafe_allow_html=True)
-        
-        items = normalize_and_aggregate_items(data.get("items", []))
-        
-        if items:
-            table_html = '<table class="w-full border-collapse mt-2"><thead><tr class="table-header">'
-            table_html += '<th class="p-2 text-left border">Description</th><th class="p-2 text-left border">Quantity</th><th class="p-2 text-left border">Price</th></tr></thead><tbody>'
-            for item in items:
-                table_html += f'<tr><td class="p-2 border">{item.get("description", "N/A")}</td>'
-                table_html += f'<td class="p-2 border">{item.get("quantity", 0)}</td>'
-                table_html += f'<td class="p-2 border">${item.get("price", 0.0):,.2f}</td></tr>'
-            table_html += '</tbody></table>'
-            st.markdown(table_html, unsafe_allow_html=True)
-        else:
-            st.markdown('<p class="text-gray-500">No items found.</p>', unsafe_allow_html=True)
-        
-        total = data.get("total", 0.0)
-        try:
-            total_float = float(str(total).replace(',','.'))
-        except (ValueError, TypeError):
-            total_float = 0.0
-        st.markdown(f'<h3 class="text-lg font-bold mt-4">Total: ${total_float:,.2f}</h3>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with col1:
-        display_doc("📄 Invoice Details", invoice_data, "invoice")
-    with col2:
-        display_doc("📑 Purchase Order Details", po_data, "po")
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<h2 class="text-xl font-semibold">🔎 Match/Mismatch Summary</h2>', unsafe_allow_html=True)
-
-    # This helper function is now used by both summary functions
-    def get_normalized_dict(items):
-        normalized = defaultdict(lambda: {"quantity": 0, "description": "", "price": 0.0})
-        if not isinstance(items, list): return normalized
-        for item in items:
-            if not isinstance(item, dict) or not item.get("description"): continue
-            desc_key = item.get("description", "").strip().lower()
-            if desc_key.startswith("culture "):
-                desc_key = desc_key[len("culture "):]
-            
-            if not normalized[desc_key]["description"]:
-                 normalized[desc_key]["description"] = item.get("description")
-            try:
-                quantity = float(item.get("quantity", 0))
-                price = float(str(item.get("price", 0.0)).replace(',','.'))
-            except (ValueError, TypeError):
-                quantity, price = 0, 0.0
-            
-            normalized[desc_key]["quantity"] += quantity
-            if price > 0:
-                 normalized[desc_key]["price"] = price # Use latest price
-        return normalized
-
-    def generate_match_summary(invoice_data, po_data):
-        lines, issues = [], []
-
-        inv_po_no_raw = invoice_data.get("po_no")
-        po_po_no_raw = po_data.get("po_no")
-        inv_po_no = str(inv_po_no_raw).strip() if inv_po_no_raw is not None else "N/A"
-        po_po_no = str(po_po_no_raw).strip() if po_po_no_raw is not None else "N/A"
-        if inv_po_no == po_po_no and inv_po_no != "N/A":
-            lines.append(f"• PO Number matches: **{po_po_no}** ✓")
-        else:
-            lines.append(f"• PO Number mismatch: Invoice ({inv_po_no}) vs PO ({po_po_no}) ✗")
-            issues.append("PO number mismatch")
-
-        inv_vendor_raw = invoice_data.get("vendor")
-        po_vendor_raw = po_data.get("vendor")
-        inv_vendor = str(inv_vendor_raw).strip().lower().replace(' ', '') if inv_vendor_raw else ""
-        po_vendor = str(po_vendor_raw).strip().lower().replace(' ', '') if po_vendor_raw else ""
-        if inv_vendor and po_vendor and (inv_vendor in po_vendor or po_vendor in inv_vendor):
-            lines.append(f"• Vendor matches: **{invoice_data.get('vendor')}** ✓")
-        else:
-            lines.append(f"• Vendor mismatch: Invoice ({inv_vendor_raw or 'N/A'}) vs PO ({po_vendor_raw or 'N/A'}) ✗")
-            issues.append("Vendor mismatch")
-
-        invoice_total = float(str(invoice_data.get("total", 0.0)).replace(',','.'))
-        po_total = float(str(po_data.get("total", 0.0)).replace(',','.'))
-        if abs(invoice_total - po_total) < 0.01:
-            lines.append(f"• Total amount matches: **SAR {invoice_total:,.2f}** ✓")
-        else:
-            lines.append(f"• **Total amount mismatch**: Invoice (SAR {invoice_total:,.2f}) vs PO (SAR {po_total:,.2f}) ✗")
-            issues.append("Total amount mismatch")
-
-        normalized_invoice_items = get_normalized_dict(invoice_data.get("items", []))
-        normalized_po_items = get_normalized_dict(po_data.get("items", []))
-        
-        lines.append("---")
-
-        all_inv_keys = set(normalized_invoice_items.keys())
-        all_po_keys = set(normalized_po_items.keys())
-
-        for inv_key in all_inv_keys:
-            inv_item = normalized_invoice_items[inv_key]
-            display_desc = inv_item.get('description', 'N/A')
-            if inv_key in all_po_keys:
-                po_item = normalized_po_items[inv_key]
-                if inv_item['quantity'] > po_item['quantity'] + 0.001:
-                    lines.append(f"• **Quantity mismatch** for '{display_desc}': Invoice ({inv_item['quantity']}) **exceeds** PO quantity ({po_item['quantity']}) ✗")
-                    issues.append("Item quantity exceeds PO")
-                elif inv_item['quantity'] < po_item['quantity'] - 0.001:
-                    lines.append(f"• Quantity for '{display_desc}' is a **partial shipment**: Invoice ({inv_item['quantity']}) of PO ({po_item['quantity']}) ⚠️")
-                else:
-                    lines.append(f"• Quantity for '{display_desc}' matches. ✓")
+if run:
+    if mode == DEMO_MODE:
+        st.session_state["docs"] = copy.deepcopy(SCENARIOS[scenario])
+        st.session_state["title"] = scenario
+    elif not (po_file and dc_file and inv_file):
+        st.error("Please upload all three documents: Purchase Order, Delivery Challan and Invoice.")
+    else:
+        with st.spinner("Reading documents and extracting fields with AI..."):
+            texts = [get_text_from_pdf(f.getvalue()) for f in (po_file, dc_file, inv_file)]
+            if all(texts):
+                payload = [EXTRACTION_PROMPT, f"--- PURCHASE ORDER TEXT ---\n{texts[0]}",
+                           f"--- DELIVERY CHALLAN TEXT ---\n{texts[1]}", f"--- INVOICE TEXT ---\n{texts[2]}"]
+                data = call_gemini(payload)
+                if data:
+                    st.session_state["docs"] = data
+                    st.session_state["title"] = "Uploaded documents"
             else:
-                lines.append(f"• Item '{display_desc}' on invoice could not be found on the PO. ✗")
-                issues.append("Unmatched invoice item")
+                st.error("Could not read text from one or more PDFs.")
 
-        if not issues:
-            lines.append('<span class="status-approved">→ Status: APPROVED ✅</span>')
-        else:
-            lines.append('<span class="status-review">→ Status: NEEDS REVIEW ⚠️ - Critical discrepancies found.</span>')
-        
-        return "<br>".join(lines)
-    
-    # --- START: AGENT SUMMARY FUNCTION (UPDATED) ---
-    def generate_agent_summary(invoice_data, po_data):
-        discrepancy_details = []
+if "docs" in st.session_state:
+    docs = st.session_state["docs"]
+    st.markdown(f"**Showing:** {html.escape(st.session_state.get('title', ''))}")
+    result = reconcile(docs["po_data"], docs["challan_data"], docs["invoice_data"])
+    render_result(result, docs)
+else:
+    st.markdown("### How Setu360 works")
+    c1, c2, c3 = st.columns(3)
+    steps = [("1", "Extract", "AI reads the Purchase Order, Delivery Challan and Invoice (even scanned PDFs) and pulls out vendor, PO number, items, quantities and prices."),
+             ("2", "Three-way match", "Every item is compared across PO → Challan → Invoice to catch over-delivery, billing for undelivered goods, price changes and vendor mismatches."),
+             ("3", "Decide", "Setu360 shows APPROVED or NEEDS REVIEW with the exact discrepancies, the amount at risk and the recommended next step.")]
+    for col, (n, t, d) in zip((c1, c2, c3), steps):
+        col.markdown(H(f'<div class="how"><div class="num">{n}</div><b>{t}</b><p>{d}</p></div>'), unsafe_allow_html=True)
+    st.info("👈 Pick a demo scenario in the sidebar and click **Run Three-Way Match** to see it working.")
 
-        # Check 1: Total Amount Mismatch
-        invoice_total = float(str(invoice_data.get("total", 0.0)).replace(',','.'))
-        po_total = float(str(po_data.get("total", 0.0)).replace(',','.'))
-        if abs(invoice_total - po_total) >= 0.01:
-            comparison = "higher" if invoice_total > po_total else "lower"
-            discrepancy_details.append(f"The **Total Amount** on the invoice (**SAR {invoice_total:,.2f}**) is {comparison} than the Purchase Order total (**SAR {po_total:,.2f}**).")
-
-        # Check 2: Line Item Mismatches
-        normalized_invoice_items = get_normalized_dict(invoice_data.get("items", []))
-        normalized_po_items = get_normalized_dict(po_data.get("items", []))
-        all_inv_keys = set(normalized_invoice_items.keys())
-        all_po_keys = set(normalized_po_items.keys())
-
-        for inv_key in all_inv_keys:
-            inv_item = normalized_invoice_items[inv_key]
-            display_desc = inv_item.get('description', 'N/A')
-
-            if inv_key not in all_po_keys:
-                discrepancy_details.append(f"The item **'{display_desc}'** appears on the invoice but was not found on the purchase order.")
-                continue
-
-            po_item = normalized_po_items[inv_key]
-            if inv_item['quantity'] > po_item['quantity'] + 0.001:
-                discrepancy_details.append(f"For the item **'{display_desc}'**, the invoice bills for **{inv_item['quantity']}** units, which exceeds the **{po_item['quantity']}** units listed on the purchase order.")
-            elif inv_item['quantity'] < po_item['quantity'] - 0.001:
-                discrepancy_details.append(f"The invoice reflects a **partial shipment** for the item **'{display_desc}'**, with **{inv_item['quantity']}** units billed out of the **{po_item['quantity']}** total units ordered.")
-        
-        # Construct final summary
-        invoice_no = invoice_data.get("invoice_no", "N/A")
-        po_no = po_data.get("po_no", "N/A")
-        intro = f"Based on the review of Invoice **{invoice_no}** against Purchase Order **{po_no}**, the following discrepancies have been identified:"
-        
-        if not discrepancy_details:
-            # If no issues were found, provide an approval summary
-            summary_html = f"""
-            <div class="agent-summary">
-                <h4>Agent-Style Summary</h4>
-                <p>A review of Invoice **{invoice_no}** against Purchase Order **{po_no}** shows that all key details match.</p>
-                <h5 class="mt-3 font-semibold">Conclusion</h5>
-                <p class="status-approved">✅ The invoice is approved for payment.</p>
-            </div>
-            """
-        else:
-            # If there are issues, list them
-            body = "".join([f"<li>{detail}</li>" for detail in discrepancy_details])
-            summary_html = f"""
-            <div class="agent-summary">
-                <h4>Agent-Style Summary</h4>
-                <p>{intro}</p>
-                <h5 class="mt-3 font-semibold">Discrepancy Details</h5>
-                <ul>{body}</ul>
-            </div>
-            """
-        return summary_html
-    # --- END: AGENT SUMMARY FUNCTION ---
-
-    match_summary = generate_match_summary(invoice_data, po_data)
-    st.markdown(match_summary, unsafe_allow_html=True)
-    
-    st.markdown("<hr>", unsafe_allow_html=True)
-    agent_summary = generate_agent_summary(invoice_data, po_data)
-    st.markdown(agent_summary, unsafe_allow_html=True)
-
-    st.markdown('</div>', unsafe_allow_html=True)
+st.markdown('<div class="s360-footer">Setu360 · Final-Year Project · Three-way matching powered by Streamlit &amp; Google Gemini</div>', unsafe_allow_html=True)
